@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import urllib.error
 
+import cardtypes as CT
 import engine as E
 import query as Q
 from store import Store
@@ -103,6 +104,84 @@ class Parsing(unittest.TestCase):
         for bad in ('card:"unterminated', 'card:X)', '', 'wat:1'):
             with self.assertRaises(Q.QueryError):
                 self.ast(bad)
+
+
+class CardTypes(unittest.TestCase):
+    """A card is listed under the first of its types, and every other section it
+    belongs to says how many of its cards live elsewhere."""
+
+    def test_multiple_types_pick_the_first_in_order(self):
+        self.assertEqual(CT.primary("Legendary Artifact Creature — Kobold"),
+                         "Creature")
+        # Land outranks everything but creatures: anything that taps for mana
+        # belongs in the part of the list you count.
+        self.assertEqual(CT.primary("Enchantment Land — Urza's Saga"), "Land")
+        self.assertEqual(CT.primary("Artifact Land"), "Land")
+        self.assertEqual(CT.primary("Legendary Creature — Dryad // Land"),
+                         "Creature")
+
+    def test_both_faces_count(self):
+        self.assertEqual(CT.types_of("Sorcery // Land"), ["Sorcery", "Land"])
+        self.assertEqual(CT.primary("Instant // Land"), "Land")
+
+    def test_supertypes_are_not_types(self):
+        self.assertEqual(CT.types_of("Basic Land — Island"), ["Land"])
+        self.assertEqual(CT.types_of("Legendary Planeswalker — Chandra"),
+                         ["Planeswalker"])
+
+    def test_tribal_is_kindred(self):
+        self.assertEqual(CT.types_of("Tribal Instant — Zombie"),
+                         ["Kindred", "Instant"])
+
+    def test_the_rest_is_other(self):
+        for line in ("Stickers", "Plane — Dominaria", "Scheme", "", None):
+            self.assertEqual(CT.primary(line), "Other")
+
+    def test_grouping_counts_and_sorting(self):
+        #        name,       qty, colors, type_line,                      cmc
+        deck = [("Bolt",       1, "R", "Instant",                          1),
+                ("Sol Ring",   1, "",  "Artifact",                         1),
+                ("Bridge",     1, "",  "Artifact Land",                    0),
+                ("Saga",       1, "",  "Enchantment Land — Urza's Saga",   0),
+                ("Island",     7, "",  "Basic Land — Island",              0),
+                ("Kobold",     1, "R", "Legendary Artifact Creature — Kobold", 0),
+                ("Ulamog",     1, "",  "Legendary Creature — Eldrazi",    11)]
+        got = {t: ([e[0] for e in cards], extra) for t, cards, extra in CT.group(deck)}
+        # Kobold is an Artifact Creature, so it lists under Creature and the
+        # Artifact section notes it; same for the two odd lands.
+        self.assertEqual(got["Creature"][0], ["Kobold", "Ulamog"])   # by cmc
+        # Both odd lands land under Land, so Artifact and Enchantment only
+        # report them -- Artifact also carries the Artifact Creature.
+        self.assertEqual(got["Land"], (["Bridge", "Island", "Saga"], 0))
+        self.assertEqual(got["Artifact"], (["Sol Ring"], 2))         # Kobold, Bridge
+        self.assertEqual(got["Enchantment"], ([], 1))                # Saga
+        self.assertNotIn("Planeswalker", got)                        # empty, absent
+
+    def test_display_order_is_not_precedence_order(self):
+        """Where a card is counted and where its section is shown are separate:
+        a land is counted high so nothing hides from the land count, but shown
+        last so it does not bury the spells."""
+        self.assertLess(CT.RANK["Land"], CT.RANK["Artifact"])
+        self.assertGreater(CT.DISPLAY.index("Land"), CT.DISPLAY.index("Artifact"))
+        deck = [("Bridge", 1, "", "Artifact Land", 0),
+                ("Bolt", 1, "R", "Instant", 1),
+                ("Sol Ring", 1, "", "Artifact", 1)]
+        got = [t for t, _, _ in CT.group(deck)]
+        self.assertEqual(got, ["Instant", "Artifact", "Land"])
+        counted = {t: [e[0] for e in c] for t, c, _ in CT.group(deck)}
+        self.assertEqual(counted["Land"], ["Bridge"])     # counted as a land
+        self.assertEqual(counted["Artifact"], ["Sol Ring"])
+
+    def test_sorted_by_value_then_symbols_then_name(self):
+        two = lambda name, colors: (name, 1, colors, "Instant", 2)
+        deck = [two("zed", "G"), two("alpha", "U"), two("beta", "U"),
+                two("gold", "UR"), two("rock", ""), two("white", "W"),
+                ("cheap", 1, "B", "Instant", 1)]
+        cards = dict((t, [e[0] for e in c]) for t, c, _ in CT.group(deck))
+        self.assertEqual(cards["Instant"],
+                         # cmc 1 first; then W U U G, multicolour, colourless;
+                         # the two blues tie on symbols and fall back to name
+                         ["cheap", "white", "alpha", "beta", "zed", "gold", "rock"])
 
 
 class Evaluating(unittest.TestCase):

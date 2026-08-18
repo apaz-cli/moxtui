@@ -349,7 +349,8 @@ def _counts(body: dict, board: str | None) -> dict:
     for b, cards in body.items():
         if board and b != board:
             continue
-        for name, qty in cards:
+        for entry in cards:
+            name, qty = entry[0], entry[1]
             for v in name_variants(name):
                 out[v] = out.get(v, 0) + qty
     return out

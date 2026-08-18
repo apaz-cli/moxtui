@@ -33,7 +33,10 @@ CREATE INDEX IF NOT EXISTS decks_author ON decks(author);
 CREATE INDEX IF NOT EXISTS decks_created ON decks(created);
 
 CREATE TABLE IF NOT EXISTS deck_cards (
-  public_id TEXT, board TEXT, card_name TEXT, qty INT
+  public_id TEXT, board TEXT, card_name TEXT, qty INT,
+  colors TEXT,        -- the card's own colours, e.g. "UR"; "" is colourless
+  type_line TEXT,
+  cmc REAL
 );
 CREATE INDEX IF NOT EXISTS deck_cards_id ON deck_cards(public_id);
 CREATE INDEX IF NOT EXISTS deck_cards_name ON deck_cards(card_name);
@@ -83,6 +86,14 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        # Card colours arrived after the first bodies were stored. They come free
+        # in the payload we already fetch, so the fix is to drop what we have and
+        # let it re-fetch rather than carry two shapes around.
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(deck_cards)")}
+        if not {"colors", "type_line", "cmc"} <= cols:
+            self.db.execute("DROP TABLE deck_cards")
+            self.db.executescript(SCHEMA)
+            self.db.execute("UPDATE decks SET body_seen_at = NULL")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.commit()
 
@@ -142,8 +153,8 @@ class Store:
     def put_body(self, pid: str, boards: dict) -> None:
         self.db.execute("DELETE FROM deck_cards WHERE public_id = ?", (pid,))
         self.db.executemany(
-            "INSERT INTO deck_cards VALUES (?,?,?,?)",
-            [(pid, b, n, q) for b, cards in boards.items() for n, q in cards],
+            "INSERT INTO deck_cards VALUES (?,?,?,?,?,?,?)",
+            [(pid, b) + tuple(c) for b, cards in boards.items() for c in cards],
         )
         self.db.execute(
             "UPDATE decks SET body_seen_at = ? WHERE public_id = ?", (time.time(), pid)
@@ -158,9 +169,11 @@ class Store:
             return None
         boards: dict = {}
         for c in self.db.execute(
-            "SELECT board, card_name, qty FROM deck_cards WHERE public_id = ?", (pid,)
+            "SELECT board, card_name, qty, colors, type_line, cmc FROM deck_cards "
+            "WHERE public_id = ?", (pid,)
         ):
-            boards.setdefault(c["board"], []).append((c["card_name"], c["qty"]))
+            boards.setdefault(c["board"], []).append(
+                (c["card_name"], c["qty"], c["colors"], c["type_line"], c["cmc"]))
         return boards
 
     def have_bodies(self, pids: list) -> set:

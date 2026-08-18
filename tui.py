@@ -16,32 +16,18 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (DataTable, Footer, Header, Input, ProgressBar,
-                             RichLog, Static, TabbedContent, TabPane, Tree)
+                             RichLog, Static)
 
 import engine as E
 import query as Q
 from api import Client, QueryError
 from builder import QueryBuilder
+from colors import color_key, pips
+from deckview import DeckView
 from store import Store
 
 COLUMNS = (("format", 12), ("color", 5), ("deck", 38), ("author", 16),
            ("likes", 6), ("views", 7), ("created", 10))
-
-WUBRG = "WUBRG"
-# Mid-tone rather than literal: real white and black mana are invisible against
-# one theme or the other, so each pip is pulled toward the middle where it reads
-# on both a light and a dark background.
-PIP = {"W": "#c9a227", "U": "#3b7fd4", "B": "#8b6fb0", "R": "#d4553b",
-       "G": "#3fa05a"}
-COLORLESS = "#9aa0a6"
-
-
-def color_key(identity: str):
-    """Fewest colours first, then WUBRG order within a count -- so mono goes
-    W U B R G and two-colour goes WU WB WR WG UB UR UG BR BG RG."""
-    have = [c for c in WUBRG if c in (identity or "").upper()]
-    return (len(have), tuple(WUBRG.index(c) for c in have))
-
 
 # column -> (sort key, descending by default)
 SORTS = {
@@ -53,18 +39,6 @@ SORTS = {
     "views": (lambda r: r["views"] or 0, True),
     "created": (lambda r: r["created"] or "", True),
 }
-
-
-def pips(identity: str) -> Text:
-    """Colour identity as coloured letters, always in WUBRG order."""
-    have = set((identity or "").upper())
-    if not have & set(WUBRG):
-        return Text("C", style=COLORLESS)
-    out = Text()
-    for c in WUBRG:
-        if c in have:
-            out.append(c, style=f"bold {PIP[c]}")
-    return out
 
 
 class MoxfieldTUI(App):
@@ -81,9 +55,8 @@ class MoxfieldTUI(App):
     """
     BINDINGS = [
         ("ctrl+c", "quit", "quit"),
-        ("ctrl+b", "build", "build query"),
-        ("ctrl+e", "explain", "explain"),
-        ("ctrl+t", "tail", "tail"),
+        ("v", "view", "view deck"),
+        ("b", "build", "build query"),
         ("o", "open", "open deck"),
     ]
 
@@ -100,7 +73,6 @@ class MoxfieldTUI(App):
         self.sort_col: str | None = None
         self.sort_flipped = False
         self.dirty = False
-        self.cell_nodes: dict = {}      # subdivision depth -> tree node
         self.counters = {"cand": 0, "match": 0, "checked": 0}
         # Progress has two phases with different denominators: enumerating is
         # measured in requests against the planner's estimate, checking in
@@ -118,11 +90,7 @@ class MoxfieldTUI(App):
         with Horizontal(id="main"):
             yield DataTable(id="results", cursor_type="row")
             with Vertical(id="side"):
-                with TabbedContent():
-                    with TabPane("coverage", id="tab-cov"):
-                        yield Tree("cells", id="cells")
-                    with TabPane("log", id="tab-log"):
-                        yield RichLog(id="log", wrap=True, markup=True)
+                yield RichLog(id="log", wrap=True, markup=True)
         with Horizontal(id="statusbar"):
             yield Static("ready", id="status")
             yield ProgressBar(id="progress", show_eta=False)
@@ -132,7 +100,6 @@ class MoxfieldTUI(App):
         t = self.query_one("#results", DataTable)
         for name, w in COLUMNS:
             self.col_keys[name] = t.add_column(name, width=w)
-        self.query_one("#cells", Tree).root.expand()
         self.query_one("#query", Input).focus()
         self.set_interval(0.2, self.refresh_status)
         self.refresh_status()
@@ -143,7 +110,7 @@ class MoxfieldTUI(App):
         """Called from the worker thread."""
         if kind == "cell":
             self.current = E.brief(kw.get("params", {}))
-            self.call_from_thread(self.add_cell, kw)
+            self.call_from_thread(self.log_cell, kw)
         elif kind == "note":
             self.call_from_thread(self.post_note, kw.get("text", ""))
         elif kind == "page":
@@ -151,20 +118,12 @@ class MoxfieldTUI(App):
         elif kind == "checked":
             self.counters["checked"] = kw.get("i", 0)
 
-    def add_cell(self, kw: dict) -> None:
-        """One node per region the crawl enters, nested by subdivision depth."""
-        tree = self.query_one("#cells", Tree)
-        label = f"{E.brief(kw.get('params', {}))}  [{kw.get('n', 0):,}]"
+    def log_cell(self, kw: dict) -> None:
+        """Each region the crawl enters, with what it found and how it closed."""
         status = kw.get("status", "")
-        if status and status != "counting":
-            label += f"  {status}"
-        depth = kw.get("depth", 0)
-        parent = self.cell_nodes.get(depth - 1, tree.root)
-        node = parent.add(label, expand=True)
-        # Anything deeper belongs under this one now, not under its predecessor.
-        self.cell_nodes = {d: n for d, n in self.cell_nodes.items() if d < depth}
-        self.cell_nodes[depth] = node
-        tree.root.expand()
+        tail = f"  [b]{status}" if status and status != "counting" else ""
+        self.post_note(f"[dim]{E.brief(kw.get('params', {}))}[/dim]  "
+                       f"{kw.get('n', 0):,}{tail}")
 
     def post_note(self, text: str) -> None:
         self.query_one("#log", RichLog).write(text)
@@ -261,12 +220,10 @@ class MoxfieldTUI(App):
     def reset(self) -> None:
         self.hits.clear()
         self.rows_data.clear()
-        self.cell_nodes.clear()
         self.dirty = False
         self.counters.update(cand=0, match=0, checked=0)
         self.set_phase("planning")
         self.query_one("#results", DataTable).clear()
-        self.query_one("#cells", Tree).clear()
 
     # ---- actions -----------------------------------------------------------
 
@@ -274,12 +231,23 @@ class MoxfieldTUI(App):
         self.reset()
         self.run_search(ev.value)
 
-    def action_explain(self) -> None:
-        self.reset()
-        self.run_search(self.query_one("#query", Input).value, dry=True)
+    def action_build(self) -> None:
+        self.push_screen(QueryBuilder(), self.on_built)
 
-    def action_tail(self) -> None:
-        self.run_tail()
+    def on_built(self, text: str | None) -> None:
+        if not text:
+            return
+        self.query_one("#query", Input).value = text
+        self.reset()
+        self.run_search(text)
+
+    def on_data_table_row_selected(self, ev: DataTable.RowSelected) -> None:
+        """Clicking (or Enter on) a row copies its link -- the thing you almost
+        always want next."""
+        url = self.url(ev.cursor_row)
+        if url:
+            self.copy_to_clipboard(url)
+            self.notify(url, title="copied to clipboard", timeout=3)
 
     def url(self, i: int | None) -> str | None:
         """Deck URL for a table row index, or None if it points at nothing."""
@@ -287,15 +255,36 @@ class MoxfieldTUI(App):
             return None
         return f"https://moxfield.com/decks/{self.hits[i]}"
 
+    def results(self) -> DataTable | None:
+        """The results table, or None when another screen is on top -- app-level
+        bindings stay live over a pushed screen, so every one of them has to
+        cope with the table not being there."""
+        found = self.screen.query("#results")
+        return found.first(DataTable) if found else None
+
+    def action_view(self) -> None:
+        """The decklist, full screen. `v` rather than enter, because enter and a
+        mouse click are the same event and that one copies the link."""
+        table = self.results()
+        if table is None:
+            return
+        i = table.cursor_row
+        if i is None or not (0 <= i < len(self.hits)):
+            return
+        row = self.store.row(self.hits[i])
+        if row is not None:
+            self.push_screen(DeckView(self.client, row))
+
     def action_open(self) -> None:
-        url = self.url(self.query_one("#results", DataTable).cursor_row)
+        table = self.results()
+        url = self.url(table.cursor_row) if table is not None else None
         if url:
             webbrowser.open(url)
 
     # ---- workers -----------------------------------------------------------
 
     @work(thread=True, exclusive=True)
-    def run_search(self, text: str, dry: bool = False) -> None:
+    def run_search(self, text: str) -> None:
         try:
             ast = Q.resolve(Q.parse(text), self.client)
             self.call_from_thread(self.post_note, "[b]" + Q.describe(ast).strip())
@@ -316,12 +305,11 @@ class MoxfieldTUI(App):
             self.call_from_thread(
                 self.post_note,
                 f"[b]~{len(est.ids):,} candidates -- {est.cost()}")
-            if dry:
-                for r in est.residual:
-                    self.call_from_thread(
-                        self.post_note, "  local: " + Q.describe(r).strip())
-                self.call_from_thread(self.set_phase, "ready")
-                return
+            # What the plan cannot settle server-side, said plainly, since
+            # those terms are what the deck-body fetches are for.
+            for r in est.residual:
+                self.call_from_thread(
+                    self.post_note, "[dim]  local: " + Q.describe(r).strip())
 
             self.call_from_thread(self.set_phase, "enumerating", est.budget,
                                   est.floor)
@@ -338,18 +326,6 @@ class MoxfieldTUI(App):
             self.call_from_thread(self.set_phase, "ready")
         finally:
             self.eng.dry = False
-
-    @work(thread=True, exclusive=True)
-    def run_tail(self) -> None:
-        # The window is 100 pages deep and we stop as soon as two pages hold
-        # nothing new, so the page budget is the honest denominator here.
-        self.call_from_thread(self.set_phase, "enumerating", 100)
-        r = self.eng.tail()
-        self.call_from_thread(self.set_phase, "done")
-        self.call_from_thread(
-            self.post_note,
-            f"tail: {r['new']} new of {r['seen']} rows"
-            + ("" if r["caught_up"] else "  [red]WARNING: never caught up"))
 
 
 def run(db: str = "moxfield.sqlite") -> None:

@@ -137,9 +137,9 @@ SELECT author, count(*) FROM decks WHERE format='commander' GROUP BY 1 ORDER BY 
 
 `python3 moxfield.py tui` (needs `pip install textual`).
 
-Query bar on top, results streaming into the table on the left, and on the right
-the **coverage tree** — the ledger as it is built, region by region, with the
-decks found and whether each closed exactly.
+Query bar on top, results streaming into the table on the left, and a log on the
+right carrying the plan, its cost, and each region the crawl enters with how it
+closed.
 
 Along the bottom is a progress bar with a request budget, taken from the same
 dry plan `explain` prints. It runs in two phases with different denominators:
@@ -160,11 +160,38 @@ arrived in.
 
 | key | |
 |---|---|
-| `ctrl+b` | build a query from a form, with a live preview of the query it writes |
-| `ctrl+e` | explain: plan and cost, fetches nothing |
-| `ctrl+t` | tail the new-deck stream |
+| `v` | view the decklist, full screen |
+| `b` | build a query from a form, with a live preview of the query it writes |
 | click / `enter` | copy the deck's link |
 | `o` | open the deck in a browser |
+
+The deck view is a full screen rather than a popup: a 100-card singleton list
+wants every row the terminal has. The **mainboard** is broken into card types laid side by side across the width:
+Creature, Planeswalker, Sorcery, Instant, Kindred, Artifact, Enchantment,
+Battle, Land, then Other for planes, schemes and sticker sheets. Every other
+board — command zone, sideboard, maybeboard — is just its cards under the board
+name, since headings there are scaffolding around nothing.
+
+Two orders are at work, because they answer different questions. Sections are
+*shown* in the order above, with lands last so they do not bury the spells. But
+a multi-type card is *counted* under Creature, Planeswalker, Land, Artifact,
+Enchantment, Sorcery, Instant, Battle, Kindred — land high, so anything that
+taps for mana lands in the count you actually take. Urza's Saga and Darksteel
+Citadel are lands shown at the end, not an enchantment and an artifact hidden in
+the middle.
+
+A card is listed once, and every other section it belongs to says how many of
+its cards are elsewhere: `Artifact (15) (+2)` means 15 artifacts listed plus two
+more that are Artifacts but appear under Creature and Land. Within a section, cards sort by
+mana value, then by mana symbols in WUBRG order (multicolour after mono,
+colourless last), then by name.
+
+Names are coloured by the card's own colour — mono takes its colour, two or more
+take gold, artifacts and lands stay neutral — and quantities are left plain. `esc` goes
+back, `o` and `c` open and copy from there too.
+
+`v`, `b` and `o` are single keys, so they only fire when the results table has
+focus — while you are typing in the query bar they are just letters.
 
 The builder is a form over the same language rather than a replacement for it —
 the preview line is the exact query that will run, so filling it in is also a way

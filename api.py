@@ -185,9 +185,14 @@ class Client:
             raise
         boards = {}
         for bname, b in (d.get("boards") or {}).items():
-            cards = [((e.get("card") or {}).get("name"), e.get("quantity", 1))
-                     for e in (b.get("cards") or {}).values()]
-            cards = [(n, q) for n, q in cards if n]
+            cards = []
+            for e in (b.get("cards") or {}).values():
+                card = e.get("card") or {}
+                if card.get("name"):
+                    cards.append((card["name"], e.get("quantity", 1),
+                                  "".join(card.get("colors") or []),
+                                  card.get("type_line") or "",
+                                  card.get("cmc") or 0))
             if cards:
                 boards[bname] = cards
         self.store.put_body(pid, boards)
