@@ -1,0 +1,26 @@
+name: windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest      # PyInstaller cannot cross-compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install textual pyinstaller
+      - run: python -m unittest test_moxfield -v
+      - run: pyinstaller --clean --noconfirm moxfield.spec
+      - name: smoke test the exe
+        run: |
+          dist\moxfield.exe --help
+          dist\moxfield.exe explain --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moxfield-windows
+          path: dist/moxfield.exe

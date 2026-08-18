@@ -1,0 +1,2 @@
+# Core needs nothing but the standard library.
+textual>=1.0     # only for `moxfield.py tui`

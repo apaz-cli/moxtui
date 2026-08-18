@@ -1,0 +1,6 @@
+moxfield.sqlite*
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
