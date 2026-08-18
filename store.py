@@ -108,6 +108,8 @@ class Store:
     def __init__(self, path: str = "moxfield.sqlite"):
         self.path = path
         self._local = threading.local()
+        self._open: list[sqlite3.Connection] = []
+        self._lock = threading.Lock()
         self.db.executescript(SCHEMA)
         # Card colours arrived after the first bodies were stored. They come free
         # in the payload we already fetch, so the fix is to drop what we have and
@@ -135,16 +137,25 @@ class Store:
     def db(self) -> sqlite3.Connection:
         db = getattr(self._local, "db", None)
         if db is None:
-            db = sqlite3.connect(self.path, timeout=30)
+            # check_same_thread guards against the sharing this property makes
+            # impossible anyway, and leaving it on would stop close() from
+            # releasing a worker's connection -- which Windows needs, since it
+            # will not delete a database file anyone still holds open.
+            db = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
             db.row_factory = sqlite3.Row
             self._local.db = db
+            with self._lock:
+                self._open.append(db)
         return db
 
     def close(self) -> None:
-        db = getattr(self._local, "db", None)
-        if db is not None:
+        """Every thread's connection, not just this one's: a worker that has
+        finished leaves its handle behind until the collector gets to it."""
+        with self._lock:
+            open_, self._open = self._open, []
+        for db in open_:
             db.close()
-            self._local.db = None
+        self._local.db = None
 
     # ---- rows --------------------------------------------------------------
 

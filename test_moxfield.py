@@ -259,7 +259,10 @@ class CellSizeProbe(unittest.TestCase):
         """Only the image aspect depends on this, and every common terminal --
         and the VT340 the library would otherwise assume -- is 1 wide to 2 tall."""
         import cardpanel
-        from textual_image import _terminal as t
+        try:
+            from textual_image import _terminal as t
+        except ModuleNotFoundError:
+            self.skipTest("textual-image not installed")
         size = t.get_cell_size()
         self.assertAlmostEqual(size.height / size.width, 2.0, delta=0.5)
 
