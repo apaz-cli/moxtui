@@ -14,10 +14,7 @@ See [DESIGN.md](DESIGN.md) for how completeness is established and
 python3 moxfield.py search 'cmdr:"Rograkh, Son of Rohgahh" card:"Cloudstone Curio"'
 python3 moxfield.py search 'f:edh (card:Windfall or card:"Wheel of Fortune") -card:"Mana Crypt"'
 python3 moxfield.py search 'f:modern main:"4x Lightning Bolt" likes>10'
-python3 moxfield.py explain 'f:edh likes>1000'      # plan and cost, fetches nothing
-python3 moxfield.py tail --watch 3600               # ingest the new-deck stream
-python3 moxfield.py sweep                           # enumerate known users' decks
-python3 moxfield.py tui                             # interactive
+python3 moxfield.py [tui]                           # interactive; the default
 ```
 
 Results stream as they are confirmed, so `| head` and `--limit` are cheap.
@@ -77,7 +74,7 @@ alone cannot — it would match millions — and a negated term never can.
 
 ## Cost
 
-Three things make queries cheap, and `explain` shows all of them:
+Three things make queries cheap, and the plan report shows all of them:
 
 - **Rows, not decks.** A search row carries every field except the card list and
   arrives 100 to a request, so filters like `likes>10` cost nothing. A deck body
@@ -88,8 +85,11 @@ Three things make queries cheap, and `explain` shows all of them:
 - **The ledger.** Every region already enumerated is recorded with its members,
   so overlapping queries are nearly free and an interrupted crawl resumes.
 
+`search` prices a query before it runs, and when the answer is large or will
+need subdividing it prints the plan and asks first (`-y` skips):
+
 ```
-$ python3 moxfield.py explain 'cmdr:"Rograkh, Son of Rohgahh" card:"Cloudstone Curio"'
+$ python3 moxfield.py search 'cmdr:"Rograkh, Son of Rohgahh" card:"Cloudstone Curio"'
 AND
   Rograkh, Son of Rohgahh  [commanders]
   Cloudstone Curio  [any board]
@@ -98,9 +98,6 @@ candidates: 1732  [exact]
   commanderCardId=YMXJd, cardId=6JO99 -> 1732
 estimated cost: 20 requests (~0 min at 1.4 req/s)
 ```
-
-`search` prices the query the same way before it starts, and asks first if the
-answer is large or will need subdividing (`-y` skips).
 
 AND and OR pull in opposite directions: AND can be driven by whichever term is
 cheapest, so adding terms makes a query *faster*, while OR must cover every
@@ -124,9 +121,9 @@ completeness: unverified
   exhausted every window at 19999 decks
 ```
 
-`tail` keeps the corpus current: the newest-10,000 window is ~18 hours deep, so
-polling it more often than that sees every deck created from now on, for about
-130 requests a day.
+The tail crawler keeps the corpus current: the newest-10,000 window is ~18 hours
+deep, so polling it more often than that sees every deck created from now on, for
+about 130 requests a day.
 
 ## The corpus
 
@@ -141,14 +138,14 @@ SELECT author, count(*) FROM decks WHERE format='commander' GROUP BY 1 ORDER BY 
 
 ## TUI
 
-`python3 moxfield.py tui` (needs `pip install textual`).
+`python3 moxfield.py`, or `moxfield.py tui` (needs `pip install textual`).
 
 Query bar on top, results streaming into the table on the left, and a log on the
 right carrying the plan, its cost, and each region the crawl enters with how it
 closed.
 
-Along the bottom is a progress bar with a request budget, taken from the same
-dry plan `explain` prints. It runs in two phases with different denominators:
+Along the bottom is a progress bar with a request budget, taken from the same dry
+plan the cost report prints. It runs in two phases with different denominators:
 
 ```
 enumerating · 412 of ~1,240 requests · 38,100 decks seen · 412 requests

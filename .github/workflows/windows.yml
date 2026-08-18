@@ -21,7 +21,7 @@ jobs:
       - name: smoke test the exe
         run: |
           dist\moxfield.exe --help
-          dist\moxfield.exe explain --help
+          dist\moxfield.exe search --help
       # Two destinations on purpose. The artifact is for a manual run: it lives
       # on the run page, needs a login, and expires. The release asset is the
       # one people download, and only a tag has somewhere to put it.

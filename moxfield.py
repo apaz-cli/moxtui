@@ -2,11 +2,8 @@
 """Moxfield deck search: a query language over the public API, plus a local
 corpus that makes the answers complete and repeat queries free.
 
+  moxfield.py                # interactive
   moxfield.py search 'cmdr:"Rograkh, Son of Rohgahh" card:"Cloudstone Curio"'
-  moxfield.py explain 'f:edh card:Windfall -card:"Mana Crypt"'
-  moxfield.py tail          # ingest the global new-deck stream
-  moxfield.py sweep         # enumerate known users' decks
-  moxfield.py tui           # interactive
 """
 
 from __future__ import annotations
@@ -68,14 +65,6 @@ def _report(plan, out=sys.stderr):
         print(f"estimated cost: {plan.cost()}", file=out)
 
 
-def cmd_explain(args):
-    _, client, eng = build(args, dry=True)
-    ast = Q.resolve(Q.parse(" ".join(args.query)), client)
-    print(Q.describe(ast).rstrip(), file=sys.stderr)
-    _report(eng.solve(ast))
-    return 0
-
-
 CONFIRM_ABOVE = 2000    # candidates, before asking on an interactive terminal
 
 
@@ -119,27 +108,6 @@ def cmd_search(args):
     return 0
 
 
-def cmd_tail(args):
-    _, client, eng = build(args)
-    while True:
-        r = eng.tail(args.pages)
-        print(f"tail: {r['new']} new of {r['seen']} rows"
-              f"{'' if r['caught_up'] else '  WARNING: never caught up'}")
-        if not args.watch:
-            return 0
-        time.sleep(args.watch)
-
-
-def cmd_sweep(args):
-    _, client, eng = build(args)
-    r = eng.sweep_users(args.limit)
-    warn = (f"  ({r['partial_batches']} batches hit the window and were not "
-            f"counted exactly)" if r["partial_batches"] else "")
-    print(f"swept {r['users']} users, {r['decks']} decks, "
-          f"{client.requests} requests{warn}")
-    return 0
-
-
 def cmd_tui(args):
     from tui import run
     run(args.db)
@@ -160,31 +128,21 @@ def main(argv=None) -> int:
         description=__doc__.split("\n")[0], epilog=EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=default_db())
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
 
-    for name, fn in (("search", cmd_search), ("explain", cmd_explain)):
-        p = sub.add_parser(name)
-        p.add_argument("query", nargs="+")
-        p.add_argument("--limit", type=int)
-        p.add_argument("--json", action="store_true")
-        p.add_argument("-y", "--yes", action="store_true",
-                       help="skip the confirmation on a large crawl")
-        p.set_defaults(fn=fn)
-
-    p = sub.add_parser("tail", help="ingest the global new-deck stream")
-    p.add_argument("--pages", type=int, default=100)
-    p.add_argument("--watch", type=int, metavar="SECONDS")
-    p.set_defaults(fn=cmd_tail)
-
-    p = sub.add_parser("sweep", help="enumerate known users' decks")
-    p.add_argument("--limit", type=int, default=1000)
-    p.set_defaults(fn=cmd_sweep)
+    p = sub.add_parser("search")
+    p.add_argument("query", nargs="+")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="skip the confirmation on a large crawl")
+    p.set_defaults(fn=cmd_search)
 
     sub.add_parser("tui").set_defaults(fn=cmd_tui)
 
     a = ap.parse_args(argv)
     try:
-        return a.fn(a)
+        return getattr(a, "fn", cmd_tui)(a)     # no subcommand: launch the tui
     except QueryError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
