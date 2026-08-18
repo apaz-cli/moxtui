@@ -13,6 +13,7 @@ import webbrowser
 
 from rich.text import Text
 from textual import work
+from textual.binding import Binding
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (DataTable, Footer, Header, Input, ProgressBar,
@@ -20,11 +21,29 @@ from textual.widgets import (DataTable, Footer, Header, Input, ProgressBar,
 
 import engine as E
 import query as Q
+import api
 from api import Client, QueryError
 from builder import QueryBuilder
 from colors import color_key, pips
 from deckview import DeckView
 from store import Store
+
+class ResultsTable(DataTable):
+    """The results table, with enter and right opening the deck view.
+
+    Bound here rather than on the app: an app-level binding would have to be
+    `priority` to beat the table's own, and would then fire while the query bar
+    has focus -- so enter would open a deck instead of running the search.
+    """
+
+    BINDINGS = [
+        Binding("enter", "open_deck", "view deck"),
+        Binding("right", "open_deck", "view deck", show=False),
+    ]
+
+    def action_open_deck(self) -> None:
+        self.app.action_view()
+
 
 COLUMNS = (("format", 12), ("color", 5), ("deck", 38), ("author", 16),
            ("likes", 6), ("views", 7), ("created", 10))
@@ -54,7 +73,12 @@ class MoxfieldTUI(App):
     DataTable { height: 1fr; }
     """
     BINDINGS = [
-        ("ctrl+c", "quit", "quit"),
+        # One visible entry naming all three: Textual shows a single line per
+        # action, and it hides ctrl+c on the default screen because it has a
+        # built-in binding of its own -- so `q` is the one that always shows.
+        Binding("q", "quit", "quit (or ^c, esc)"),
+        Binding("ctrl+c", "quit", "quit", show=False),
+        Binding("escape", "quit", "quit", show=False),
         ("v", "view", "view deck"),
         ("b", "build", "build query"),
         ("o", "open", "open deck"),
@@ -64,7 +88,6 @@ class MoxfieldTUI(App):
         super().__init__()
         self.store = Store(db)
         self.client = Client(self.store, log=lambda s: self.post_note(s))
-        self.eng = E.Engine(self.client, self.store, on_event=self.on_engine_event)
         self.hits: list = []
         self.rows_data: list = []       # matches in arrival order
         self.col_keys: dict = {}
@@ -77,6 +100,7 @@ class MoxfieldTUI(App):
         # Progress has two phases with different denominators: enumerating is
         # measured in requests against the planner's estimate, checking in
         # decks against a candidate count that is known exactly by then.
+        self.generation = 0     # bumped per search; older workers stand down
         self.phase = "ready"
         self.current = ""        # region being counted or paged right now
         self.budget = 0          # estimated requests for this run
@@ -88,7 +112,7 @@ class MoxfieldTUI(App):
         yield Input(placeholder='card:"Sol Ring" cmdr:"Rograkh, Son of Rohgahh"',
                     id="query")
         with Horizontal(id="main"):
-            yield DataTable(id="results", cursor_type="row")
+            yield ResultsTable(id="results", cursor_type="row")
             with Vertical(id="side"):
                 yield RichLog(id="log", wrap=True, markup=True)
         with Horizontal(id="statusbar"):
@@ -126,7 +150,9 @@ class MoxfieldTUI(App):
                        f"{kw.get('n', 0):,}{tail}")
 
     def post_note(self, text: str) -> None:
-        self.query_one("#log", RichLog).write(text)
+        log = self.widget("#log", RichLog)
+        if log is not None:
+            log.write(text)
 
     def set_phase(self, phase: str, budget: int = 0, floor: bool = False) -> None:
         self.phase = phase
@@ -141,7 +167,9 @@ class MoxfieldTUI(App):
             self.dirty = False
             self.render_rows()
         c, done = self.counters, self.client.requests
-        bar = self.query_one("#progress", ProgressBar)
+        bar = self.widget("#progress", ProgressBar)
+        if bar is None:
+            return
         if self.phase == "enumerating":
             spent = done - self.req0
             # A floor estimate can be overrun; grow it rather than pin the bar
@@ -163,8 +191,9 @@ class MoxfieldTUI(App):
             bar.update(total=1, progress=1 if self.phase == "done" else 0)
             text = f"{self.phase} · {c['match']:,} matches"
         thr = f" ({self.client.throttled} throttled)" if self.client.throttled else ""
-        self.query_one("#status", Static).update(
-            f"{text} · {done:,} requests{thr}")
+        label = self.widget("#status", Static)
+        if label is not None:
+            label.update(f"{text} · {done:,} requests{thr}")
 
     @staticmethod
     def cells(row) -> tuple:
@@ -177,14 +206,18 @@ class MoxfieldTUI(App):
         self.counters["match"] = len(self.rows_data)
         if self.sort_col is None:
             self.hits.append(row["public_id"])
-            self.query_one("#results", DataTable).add_row(*self.cells(row))
+            table = self.widget("#results", DataTable)
+            if table is not None:
+                table.add_row(*self.cells(row))
         else:
             # Re-sorting per row would be quadratic; the refresh timer folds
             # a burst of arrivals into one redraw.
             self.dirty = True
 
     def render_rows(self) -> None:
-        table = self.query_one("#results", DataTable)
+        table = self.widget("#results", DataTable)
+        if table is None:
+            return
         rows = self.rows_data
         if self.sort_col is not None:
             key, desc = SORTS[self.sort_col]
@@ -218,12 +251,16 @@ class MoxfieldTUI(App):
         self.render_rows()
 
     def reset(self) -> None:
+        # Any crawl still running belongs to a query nobody is looking at now.
+        self.generation += 1
         self.hits.clear()
         self.rows_data.clear()
         self.dirty = False
         self.counters.update(cand=0, match=0, checked=0)
         self.set_phase("planning")
-        self.query_one("#results", DataTable).clear()
+        table = self.widget("#results", DataTable)
+        if table is not None:
+            table.clear()
 
     # ---- actions -----------------------------------------------------------
 
@@ -255,6 +292,27 @@ class MoxfieldTUI(App):
             return None
         return f"https://moxfield.com/decks/{self.hits[i]}"
 
+    @property
+    def main(self):
+        """The base screen. Its widgets keep updating while another screen is
+        pushed on top, so anything driven by a timer or a worker must look
+        there rather than at whatever the user is currently looking at."""
+        return self.screen_stack[0]
+
+    def widget(self, selector: str, kind):
+        """A base-screen widget, or None if it is not there.
+
+        Timers and worker threads fire during mounting, unmounting and teardown,
+        when the tree is not what they expect. None of them is worth an
+        exception -- they are all painting progress on a search that is running
+        perfectly well.
+        """
+        try:
+            found = self.main.query(selector)
+        except Exception:
+            return None
+        return found.first(kind) if found else None
+
     def results(self) -> DataTable | None:
         """The results table, or None when another screen is on top -- app-level
         bindings stay live over a pushed screen, so every one of them has to
@@ -285,47 +343,59 @@ class MoxfieldTUI(App):
 
     @work(thread=True, exclusive=True)
     def run_search(self, text: str) -> None:
+        mine = self.generation
+        api.cancel_when(lambda: self.generation != mine)
+
+        def ui(fn, *args):
+            """Only the current search may touch the screen."""
+            if self.generation == mine:
+                self.call_from_thread(fn, *args)
+
+        # A fresh engine per search rather than one shared: `dry` is mutable
+        # state on it, and two overlapping crawls would flip it under each
+        # other while one of them was still pricing.
+        eng = E.Engine(self.client, self.store, on_event=self.on_engine_event)
         try:
             ast = Q.resolve(Q.parse(text), self.client)
-            self.call_from_thread(self.post_note, "[b]" + Q.describe(ast).strip())
+            ui(self.post_note, "[b]" + Q.describe(ast).strip())
 
             # Price it first. Counts are memoised, so the real plan re-uses
             # them and the estimate costs nothing beyond the planning itself.
-            self.eng.dry = True
-            est = self.eng.solve(ast)
-            self.eng.dry = False
+            eng.dry = True
+            est = eng.solve(ast)
+            eng.dry = False
             for n in est.notes:
-                self.call_from_thread(self.post_note, f"  {n}")
+                ui(self.post_note, f"  {n}")
             if est.ids is None:
-                self.call_from_thread(
-                    self.post_note, "[red]nothing in this query can generate "
-                                    "candidates")
-                self.call_from_thread(self.set_phase, "ready")
+                ui(self.post_note,
+                   "[red]nothing in this query can generate candidates")
+                ui(self.set_phase, "ready")
                 return
-            self.call_from_thread(
-                self.post_note,
-                f"[b]~{len(est.ids):,} candidates -- {est.cost()}")
+            ui(self.post_note, f"[b]~{len(est.ids):,} candidates -- {est.cost()}")
             # What the plan cannot settle server-side, said plainly, since
             # those terms are what the deck-body fetches are for.
             for r in est.residual:
-                self.call_from_thread(
-                    self.post_note, "[dim]  local: " + Q.describe(r).strip())
+                ui(self.post_note, "[dim]  local: " + Q.describe(r).strip())
 
-            self.call_from_thread(self.set_phase, "enumerating", est.budget,
-                                  est.floor)
-            plan = self.eng.solve(ast)
+            ui(self.set_phase, "enumerating", est.budget, est.floor)
+            plan = eng.solve(ast)
+            if self.generation != mine:
+                return
             self.counters["cand"] = len(plan.ids or [])
-            self.call_from_thread(self.set_phase, "checking")
-            for row in self.eng.iter_matches(ast, plan):
-                self.call_from_thread(self.add_hit, row)
-            self.call_from_thread(self.set_phase, "done")
-            self.call_from_thread(
-                self.post_note, f"[b]done -- completeness: {plan.status}")
+            ui(self.set_phase, "checking")
+            for row in eng.iter_matches(ast, plan):
+                if self.generation != mine:
+                    return          # a cached body can yield with no request
+                ui(self.add_hit, row)
+            ui(self.set_phase, "done")
+            ui(self.post_note, f"[b]done -- completeness: {plan.status}")
+        except api.Cancelled:
+            ui(self.post_note, "[dim]superseded")
         except QueryError as e:
-            self.call_from_thread(self.post_note, f"[red]error: {e}")
-            self.call_from_thread(self.set_phase, "ready")
+            ui(self.post_note, f"[red]error: {e}")
+            ui(self.set_phase, "ready")
         finally:
-            self.eng.dry = False
+            api.cancel_when(None)
 
 
 def run(db: str = "moxfield.sqlite") -> None:

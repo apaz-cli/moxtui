@@ -22,6 +22,12 @@ python3 moxfield.py tui                             # interactive
 
 Results stream as they are confirmed, so `| head` and `--limit` are cheap.
 
+In the TUI, running a search abandons whichever one was still going. Textual
+cannot kill a thread, so the old crawl stands down at its next request rather
+than being killed mid-flight, and stops putting rows in a table that now belongs
+to a different query. Cancellation is per thread, so the deck-body fetch behind
+the card panel is untouched.
+
 ## Query language
 
 Terms are ANDed by juxtaposition. `or` joins, `-` negates, parentheses group.
@@ -158,9 +164,15 @@ by number of colours, WUBRG-ordered within each count (`C W U B R G WU WG UG BR
 RG …`). Clicking again reverses it, and a third click restores the order results
 arrived in.
 
+`ctrl+c` and `esc` quit from every screen. `q` quits the results screen and
+backs out of a deck. (`q` types a letter while the query bar or the builder's
+form has focus, which is why the footer's visible entry names the other keys
+too.)
+
 | key | |
 |---|---|
-| `v` | view the decklist, full screen |
+| `enter`, `→`, `v` | open the decklist, full screen |
+| `q`, `←`, `⌫` | back, from the deck view |
 | `b` | build a query from a form, with a live preview of the query it writes |
 | click / `enter` | copy the deck's link |
 | `o` | open the deck in a browser |
@@ -187,8 +199,69 @@ mana value, then by mana symbols in WUBRG order (multicolour after mono,
 colourless last), then by name.
 
 Names are coloured by the card's own colour — mono takes its colour, two or more
-take gold, artifacts and lands stay neutral — and quantities are left plain. `esc` goes
-back, `o` and `c` open and copy from there too.
+take gold, artifacts and lands stay neutral — and quantities are left plain.
+
+### The card panel
+
+Arrow keys or `hjkl` move a cursor around the list, and clicking a card selects
+it; either way a reserved panel shows that card in full — mana cost, type line,
+oracle text, power/toughness or loyalty, flavour text, and the printing.
+
+The panel goes **beside** the list on a wide terminal and **below** it on a
+narrow or tall one, whichever leaves the decklist more room, and disappears
+entirely rather than squeezing the list below readable. A half-block card image
+is about 40 columns by 28 rows — wider than tall in cells, since a cell is
+roughly twice as tall as it is wide — so the card's own shape does not argue for
+one side or the other; the terminal's does.
+
+Card detail costs nothing to collect: mana cost, oracle text, type line, rarity,
+artist and set all arrive in the deck payloads already being fetched, so they
+are harvested into a `cards_detail` table as decks are read. One row per card
+rather than one per card per deck.
+
+Downloaded images are cached in the system temp directory (`/tmp` on Unix,
+`%TEMP%` on Windows — asked of Python rather than hard-coded), under a
+per-user name since `/tmp` is shared. Losing them to a reboot costs only
+bandwidth: every file is re-downloadable from an id in `cards_detail`.
+
+The panel also shows the card's **original** printing and its picture. The
+printing a deck uses is whichever one the builder picked, so the first printing
+comes from one Scryfall query per card — which returns the image URL with it,
+where Moxfield's own editions endpoint carries no Scryfall id and would need a
+second lookup. Both are cached permanently, the lookup in `cards_detail` and the
+picture in the temp directory, and both are fetched lazily when the cursor settles on
+a card rather than per keypress.
+
+**Clicking the card turns it over.** A transform or modal double-faced card
+shows its other side — name, cost, type line, oracle text and picture — and
+clicking again turns it back. Split, adventure and flip cards do not turn:
+they have two faces but only one picture, so there is nothing on the other
+side. The heading says which side you are looking at.
+
+Pictures need `pip install textual-image`, which uses the terminal's graphics
+protocol (Kitty, Sixel) where there is one and Unicode half-blocks where there
+is not. When there is no picture to show — no library, no network, a card with
+no image, or a file that will not decode — the picture is not merely blank, it
+is removed, and the text takes the whole panel rather than leaving a reserved
+hole.
+
+`MOXFIELD_CARD_IMAGES` chooses the renderer: `0` for none, `auto` (the default),
+or `tgp`/`kitty`, `sixel`, `halfcell`, `unicode` to force one. Forcing exists
+because auto-detection is unreliable by construction — the library asks the
+terminal over stdin and gives up after 100ms, so any multiplexer that does not
+answer reads as "no support", and a terminal advertising a protocol it does not
+honour reads as "supported".
+
+Under **herdr** it picks Kitty graphics without asking. herdr reads Kitty
+placements out of the pane and repaints them to the host terminal, so the
+protocol works there — it simply never replies to the query, and detection would
+otherwise fall back to half-blocks. `MOXFIELD_CARD_IMAGES=halfcell` overrides
+that if the passthrough misbehaves. `o` and `c` open and copy from there too, and the deck's URL is printed in full
+and marked up as a terminal hyperlink (OSC 8), so the terminal can open or copy
+it without the app's help.
+
+`←` only leaves when there is nothing to its left, so it backs out of the deck
+you just opened without interfering with moving around the list.
 
 `v`, `b` and `o` are single keys, so they only fire when the results table has
 focus — while you are typing in the query bar they are just letters.

@@ -1,2 +1,4 @@
 # Core needs nothing but the standard library.
-textual>=1.0     # only for `moxfield.py tui`
+textual>=1.0       # only for `moxfield.py tui`
+textual-image      # optional: card images in the deck view; without it the
+                   # panel is text only, which is a supported state

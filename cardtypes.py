@@ -83,7 +83,10 @@ def group(entries: list) -> list:
 
     out = []
     for t in DISPLAY:
-        if t in shown or t in elsewhere:
+        # A section with nothing in it is not worth a heading, even when cards
+        # of that type exist elsewhere -- one Kindred instant should not buy a
+        # Kindred column that lists nothing.
+        if t in shown:
             cards = sorted(shown.get(t, []), key=order)
             out.append((t, cards, elsewhere.get(t, 0)))
     return out

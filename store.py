@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 
 SCHEMA = """
@@ -36,10 +37,32 @@ CREATE TABLE IF NOT EXISTS deck_cards (
   public_id TEXT, board TEXT, card_name TEXT, qty INT,
   colors TEXT,        -- the card's own colours, e.g. "UR"; "" is colourless
   type_line TEXT,
-  cmc REAL
+  cmc REAL,
+  unique_card_id TEXT -- joins to `cards`
 );
 CREATE INDEX IF NOT EXISTS deck_cards_id ON deck_cards(public_id);
 CREATE INDEX IF NOT EXISTS deck_cards_name ON deck_cards(card_name);
+
+-- Card detail, harvested from every deck body we fetch. The payload carries all
+-- of this already and we used to throw it away; keeping it here rather than on
+-- deck_cards means one row per card instead of one per card per deck.
+CREATE TABLE IF NOT EXISTS cards_detail (
+  unique_card_id TEXT PRIMARY KEY,
+  name TEXT, mana_cost TEXT, type_line TEXT, oracle_text TEXT,
+  power TEXT, toughness TEXT, loyalty TEXT, flavor_text TEXT,
+  set_code TEXT, set_name TEXT, released_at TEXT, rarity TEXT, artist TEXT,
+  scryfall_id TEXT,
+  -- `layout` decides whether there is a back to turn to at all: a transform or
+  -- modal card has a second image, a split or adventure card puts both faces on
+  -- one picture.
+  layout TEXT,
+  back_name TEXT, back_mana_cost TEXT, back_type_line TEXT, back_oracle_text TEXT,
+  back_power TEXT, back_toughness TEXT, back_flavor_text TEXT,
+  -- The earliest printing, filled in lazily: the deck's own printing is
+  -- whatever the builder happened to pick.
+  orig_set TEXT, orig_set_name TEXT, orig_released_at TEXT,
+  orig_scryfall_id TEXT, orig_artist TEXT
+);
 
 CREATE TABLE IF NOT EXISTS users (
   user_name TEXT PRIMARY KEY, deck_count INT, last_swept REAL
@@ -83,22 +106,45 @@ def row_of(r: dict) -> tuple:
 
 class Store:
     def __init__(self, path: str = "moxfield.sqlite"):
-        self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self.path = path
+        self._local = threading.local()
         self.db.executescript(SCHEMA)
         # Card colours arrived after the first bodies were stored. They come free
         # in the payload we already fetch, so the fix is to drop what we have and
         # let it re-fetch rather than carry two shapes around.
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(deck_cards)")}
-        if not {"colors", "type_line", "cmc"} <= cols:
-            self.db.execute("DROP TABLE deck_cards")
+        detail = {r[1] for r in self.db.execute("PRAGMA table_info(cards_detail)")}
+        if (not {"colors", "type_line", "cmc", "unique_card_id"} <= cols
+                or not {"layout", "back_name"} <= detail):
+            self.db.execute("DROP TABLE IF EXISTS deck_cards")
+            self.db.execute("DROP TABLE IF EXISTS cards_detail")
             self.db.executescript(SCHEMA)
             self.db.execute("UPDATE decks SET body_seen_at = NULL")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.commit()
 
+    # One connection per thread, opened on first use. The TUI reads card detail
+    # on the UI thread while its art worker reads the same row from its own, and
+    # a connection caches one prepared statement per SQL string: same query from
+    # two threads is one statement being reset under a live fetch, which sqlite
+    # reports as "bad parameter or other API misuse". A connection per thread is
+    # a statement cache per thread. WAL belongs to the file rather than the
+    # connection, so the constructor sets it once and every later connection
+    # reads while one of them writes; the timeout is what serialises writers.
+    @property
+    def db(self) -> sqlite3.Connection:
+        db = getattr(self._local, "db", None)
+        if db is None:
+            db = sqlite3.connect(self.path, timeout=30)
+            db.row_factory = sqlite3.Row
+            self._local.db = db
+        return db
+
     def close(self) -> None:
-        self.db.close()
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            db.close()
+            self._local.db = None
 
     # ---- rows --------------------------------------------------------------
 
@@ -153,7 +199,7 @@ class Store:
     def put_body(self, pid: str, boards: dict) -> None:
         self.db.execute("DELETE FROM deck_cards WHERE public_id = ?", (pid,))
         self.db.executemany(
-            "INSERT INTO deck_cards VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO deck_cards VALUES (?,?,?,?,?,?,?,?)",
             [(pid, b) + tuple(c) for b, cards in boards.items() for c in cards],
         )
         self.db.execute(
@@ -169,11 +215,12 @@ class Store:
             return None
         boards: dict = {}
         for c in self.db.execute(
-            "SELECT board, card_name, qty, colors, type_line, cmc FROM deck_cards "
-            "WHERE public_id = ?", (pid,)
+            "SELECT board, card_name, qty, colors, type_line, cmc, unique_card_id "
+            "FROM deck_cards WHERE public_id = ?", (pid,)
         ):
             boards.setdefault(c["board"], []).append(
-                (c["card_name"], c["qty"], c["colors"], c["type_line"], c["cmc"]))
+                (c["card_name"], c["qty"], c["colors"], c["type_line"], c["cmc"],
+                 c["unique_card_id"]))
         return boards
 
     def have_bodies(self, pids: list) -> set:
@@ -184,6 +231,30 @@ class Store:
                  f"AND public_id IN ({','.join('?' * len(chunk))})")
             got |= {r[0] for r in self.db.execute(q, chunk)}
         return got
+
+    def put_cards(self, cards: list) -> None:
+        """Upsert harvested card detail, without clobbering an original printing
+        we already looked up."""
+        self.db.executemany(
+            "INSERT INTO cards_detail (unique_card_id, name, mana_cost, type_line,"
+            " oracle_text, power, toughness, loyalty, flavor_text, set_code,"
+            " set_name, released_at, rarity, artist, scryfall_id, layout,"
+            " back_name, back_mana_cost, back_type_line, back_oracle_text,"
+            " back_power, back_toughness, back_flavor_text) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(unique_card_id) DO NOTHING", cards)
+
+    def card(self, unique_card_id: str):
+        return self.db.execute(
+            "SELECT * FROM cards_detail WHERE unique_card_id = ?",
+            (unique_card_id,)).fetchone()
+
+    def put_original(self, unique_card_id: str, orig: tuple) -> None:
+        self.db.execute(
+            "UPDATE cards_detail SET orig_set=?, orig_set_name=?, "
+            "orig_released_at=?, orig_scryfall_id=?, orig_artist=? "
+            "WHERE unique_card_id = ?", orig + (unique_card_id,))
+        self.db.commit()
 
     # ---- users -------------------------------------------------------------
 

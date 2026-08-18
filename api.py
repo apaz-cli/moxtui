@@ -9,6 +9,7 @@ import gzip
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +40,28 @@ class QueryError(Exception):
     pass
 
 
+class Cancelled(Exception):
+    """Raised inside a request loop that has been abandoned."""
+
+
+# Cancellation is per thread, not per client. A worker abandons its own crawl
+# without touching anyone else's -- the deck-body fetch behind the card panel
+# runs on a different thread and carries on regardless. Textual cannot kill a
+# thread worker, so a crawl has to agree to stop, and the request boundary is
+# where it costs nothing to ask.
+_cancel = threading.local()
+
+
+def cancel_when(predicate) -> None:
+    """Abandon requests on this thread once `predicate()` is true."""
+    _cancel.stop = predicate
+
+
+def _abandoned() -> bool:
+    stop = getattr(_cancel, "stop", None)
+    return bool(stop and stop())
+
+
 def norm(s: str) -> str:
     return " ".join(s.casefold().split())
 
@@ -47,6 +70,39 @@ def name_variants(full: str) -> set:
     """A split/DFC card is stored under "A // B" but users type either face."""
     parts = [p.strip() for p in full.split("//")]
     return {norm(full)} | {norm(p) for p in parts if p}
+
+
+def card_colors(card: dict) -> str:
+    """Every colour on the card, both faces together, in WUBRG order.
+
+    A double-faced card carries an empty top-level `colors` and puts the real
+    ones on each face, so reading only the top level paints every DFC as
+    colourless. The union is the card's colour: Valakut Awakening is red on the
+    face that costs mana, and that is what it is.
+    """
+    seen = set(card.get("colors") or [])
+    for face in card.get("card_faces") or []:
+        seen |= set(face.get("colors") or [])
+    return "".join(c for c in "WUBRG" if c in seen)
+
+
+def _detail(uid: str, c: dict) -> tuple:
+    """Card fields worth keeping out of a deck payload. Free -- we already paid
+    for this response to get the card list."""
+    faces = c.get("card_faces") or []
+    face = faces[0] if faces else {}
+    back = faces[1] if len(faces) > 1 else {}
+    pick = lambda k: c.get(k) or face.get(k) or ""
+    bpick = lambda k: str(back.get(k) or "")
+    return (uid, c.get("name") or "", pick("mana_cost"), c.get("type_line") or "",
+            pick("oracle_text"), str(pick("power")), str(pick("toughness")),
+            str(pick("loyalty")), pick("flavor_text"), c.get("set") or "",
+            c.get("set_name") or "", c.get("released_at") or "",
+            c.get("rarity") or "", c.get("artist") or "",
+            c.get("scryfall_id") or "", c.get("layout") or "",
+            bpick("name"), bpick("mana_cost"), bpick("type_line"),
+            bpick("oracle_text"), bpick("power"), bpick("toughness"),
+            bpick("flavor_text"))
 
 
 class Client:
@@ -71,6 +127,8 @@ class Client:
                 {k: v for k, v in params.items() if v is not None}
             )
         for attempt in range(tries):
+            if _abandoned():
+                raise Cancelled(path)
             gap = time.monotonic() - self._last
             if gap < self._interval:
                 time.sleep(self._interval - gap)
@@ -183,17 +241,23 @@ class Client:
             if e.code in (401, 403, 404):  # deleted or made private
                 return None
             raise
-        boards = {}
+        boards, detail = {}, []
         for bname, b in (d.get("boards") or {}).items():
             cards = []
             for e in (b.get("cards") or {}).values():
                 card = e.get("card") or {}
-                if card.get("name"):
-                    cards.append((card["name"], e.get("quantity", 1),
-                                  "".join(card.get("colors") or []),
-                                  card.get("type_line") or "",
-                                  card.get("cmc") or 0))
+                if not card.get("name"):
+                    continue
+                uid = card.get("uniqueCardId")
+                cards.append((card["name"], e.get("quantity", 1),
+                              card_colors(card),
+                              card.get("type_line") or "",
+                              card.get("cmc") or 0, uid))
+                if uid:
+                    detail.append(_detail(uid, card))
             if cards:
                 boards[bname] = cards
+        if detail:
+            self.store.put_cards(detail)
         self.store.put_body(pid, boards)
         return boards

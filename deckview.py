@@ -8,19 +8,22 @@ flows the cards into as many columns as fit.
 
 from __future__ import annotations
 
+import os
 import webbrowser
 
-from rich.columns import Columns
 from rich.console import Group
 from rich.text import Text
 from textual import work
+from textual.binding import Binding
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Static
 
-from cardtypes import group, order
-from colors import card_style, pips
+from cardlist import CardList
+from cardpanel import PANEL_H, PANEL_W, CardPanel, placement
+from colors import pips
+from scryfall import Scryfall
 
 # Display order. Anything the API returns that is not listed still shows, after
 # these -- except tokens, which are generated cards rather than deck contents.
@@ -47,11 +50,16 @@ class DeckView(Screen):
     CSS = """
     DeckView { layout: vertical; }
     #meta { height: auto; padding: 0 1; background: $panel; }
-    #cards { padding: 0 1; }
+    #body { height: 1fr; }
+    #listwrap { width: 1fr; height: 1fr; }
+    #cards { padding: 0 1; height: auto; }
+    #panel { padding: 0 1; background: $boost; }
     """
     BINDINGS = [
-        ("escape", "close", "back"),
-        ("q", "close", "back"),
+        Binding("q", "close", "back (or left, backspace)"),
+        Binding("backspace", "close", "back", show=False),
+        Binding("escape", "quit", "quit (or ^c)"),
+        Binding("ctrl+c", "quit", "quit", show=False),
         ("o", "open", "open in browser"),
         ("c", "copy", "copy link"),
     ]
@@ -61,14 +69,96 @@ class DeckView(Screen):
         self.client, self.row = client, row
         self.pid = row["public_id"]
         self.loaded = False
+        self.scryfall = Scryfall(client.store)
+        self._debounce = None
 
     def compose(self) -> ComposeResult:
         yield Static(self.meta(), id="meta")
-        yield VerticalScroll(Static("loading deck...", id="cards"))
+        with Container(id="body"):
+            with VerticalScroll(id="listwrap"):
+                yield CardList({}, ordered, id="cards")
+            yield CardPanel(id="panel")
         yield Footer()
 
     def on_mount(self) -> None:
+        self.place()
         self.load()
+
+    def on_resize(self) -> None:
+        self.place()
+
+    def place(self) -> None:
+        """Reserve the space, then let the panel render into what it got."""
+        where = placement(self.size.width, self.size.height)
+        body, panel = self.query_one("#body"), self.query_one("#panel")
+        panel.display = where != "hidden"
+        body.styles.layout = "horizontal" if where == "side" else "vertical"
+        if where == "side":
+            panel.styles.width, panel.styles.height = PANEL_W, "100%"
+            panel.fit(where, PANEL_W, self.size.height - 4)
+        else:
+            panel.styles.width, panel.styles.height = "100%", PANEL_H
+            panel.fit(where, self.size.width, PANEL_H)
+
+    # ---- selection ---------------------------------------------------------
+
+    def on_card_list_escaped(self, ev: CardList.Escaped) -> None:
+        """Left, with nothing to the left of the cursor: leave the way we came."""
+        self.action_close()
+
+    def on_card_list_selected(self, ev: CardList.Selected) -> None:
+        entry = ev.entry
+        uid = entry[5] if entry and len(entry) > 5 else None
+        detail = self.client.store.card(uid) if uid else None
+        panel = self.query_one("#panel", CardPanel)
+        # Text first, from what is already local, so the panel never lags the
+        # cursor. The picture catches up if and when it can.
+        panel.show(entry, detail, self.cached_image(detail))
+        if self._debounce is not None:
+            self._debounce.stop()
+        # Holding an arrow key would otherwise fire a lookup per keypress.
+        self._debounce = self.set_timer(0.2, self.fetch_art)
+
+    def cached_image(self, detail, face: int = 0):
+        if not detail:
+            return None
+        sid = detail["orig_scryfall_id"] or detail["scryfall_id"]
+        if not sid:
+            return None
+        suffix = "" if face == 0 else "-back"
+        path = os.path.join(self.scryfall.dir, f"{sid}-normal{suffix}.jpg")
+        return path if os.path.exists(path) else None
+
+    def on_card_panel_flip(self, ev: CardPanel.Flip) -> None:
+        """The card was turned over; fetch that side's picture if we lack it."""
+        panel = self.query_one("#panel", CardPanel)
+        panel.show(panel.entry, panel.detail,
+                   self.cached_image(panel.detail, ev.face), keep_face=True)
+        self.fetch_art()
+
+    @work(thread=True, exclusive=True)
+    def fetch_art(self) -> None:
+        """Original printing and its picture, once per card, ever."""
+        entry = self._cards().selected
+        uid = entry[5] if entry and len(entry) > 5 else None
+        if not uid:
+            return
+        panel = self.query_one("#panel", CardPanel)
+        face = panel.face
+        try:
+            detail = self.scryfall.original(uid, entry[0])
+            path = self.scryfall.image_path(
+                (detail or {}).get("orig_scryfall_id") or "", "normal",
+                "front" if face == 0 else "back")
+        except Exception:
+            return                          # decoration; never break the view
+        # The cursor -- or the side showing -- may have moved on while we were
+        # away, in which case this picture is no longer the one being asked for.
+        if self._cards().selected is entry and panel.face == face:
+            self.app.call_from_thread(panel.show, entry, detail, path, True)
+
+    def _cards(self) -> CardList:
+        return self.query_one("#cards", CardList)
 
     # ---- content -----------------------------------------------------------
 
@@ -85,8 +175,10 @@ class DeckView(Screen):
         line.append(f"   {r['likes'] or 0} likes  {r['views'] or 0} views",
                     style="dim")
         when = Text(f"created {(r['created'] or '')[:10]}  "
-                    f"updated {(r['updated'] or '')[:10]}   "
-                    f"moxfield.com/decks/{self.pid}", style="dim")
+                    f"updated {(r['updated'] or '')[:10]}   ", style="dim")
+        # The whole URL, and marked up as a real terminal hyperlink (OSC 8), so
+        # the terminal can open or copy it without going through the app.
+        when.append(self.url, style=f"dim underline link {self.url}")
         return Group(title, line, when)
 
     @work(thread=True)
@@ -97,58 +189,15 @@ class DeckView(Screen):
 
     def show(self, boards) -> None:
         self.loaded = True
-        target = self.query_one("#cards", Static)
         if not boards:
-            target.update(Text("this deck is private or has been deleted",
-                               style="italic"))
+            self.query_one("#cards", CardList).update(
+                Text("this deck is private or has been deleted", style="italic"))
             return
-        blocks = []
-        for key, title in ordered(boards):
-            entries = boards[key]
-            head = Text()
-            head.append(f"{title} ", style="bold")
-            head.append(f"({sum(e[1] for e in entries)})", style="dim")
-            # Only the mainboard earns type sections. A command zone is two
-            # cards and a maybeboard is a pile of ideas -- headings there are
-            # scaffolding around nothing.
-            body = (self.by_type(entries) if key == "mainboard"
-                    else self.flat(entries))
-            blocks += [head, body, Text("")]
-        target.update(Group(*blocks))
-
-    @classmethod
-    def flat(cls, entries: list):
-        """Every other board: just the cards, in decklist order."""
-        return Columns([cls.line(e) for e in sorted(entries, key=order)],
-                       padding=(0, 3), column_first=True)
-
-    @staticmethod
-    def line(entry) -> Text:
-        t = Text()
-        t.append(f"{entry[1]} ", style="dim")
-        t.append(entry[0], style=card_style(entry[2] if len(entry) > 2 else ""))
-        return t
-
-    @classmethod
-    def by_type(cls, entries: list):
-        """One block per card type, flowed across the width.
-
-        Blocks rather than a single list because a decklist is read type by
-        type, and side by side because that is what the terminal has spare.
-        """
-        sections = []
-        for name, cards, elsewhere in group(entries):
-            head = Text()
-            head.append(name, style="bold")
-            if cards:
-                head.append(f" ({sum(e[1] for e in cards)})", style="dim")
-            # This card is a Land too, but it is listed under Sorcery.
-            if elsewhere:
-                head.append(f" (+{elsewhere})", style="dim italic")
-            sections.append(Group(head, *(cls.line(e) for e in cards)))
-        # Bottom padding, so when the sections wrap onto a second row there is a
-        # blank line between the rows rather than headings butting into cards.
-        return Columns(sections, padding=(0, 3, 1, 0))
+        cards = self._cards()
+        cards.boards = boards
+        cards.build(cards.size.width or self.size.width)
+        cards.post_message(CardList.Selected(cards.selected))
+        cards.focus()
 
     # ---- actions -----------------------------------------------------------
 

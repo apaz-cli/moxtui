@@ -7,6 +7,7 @@ string that will run, so the form doubles as a way to learn the language.
 from __future__ import annotations
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static
@@ -57,7 +58,12 @@ class QueryBuilder(ModalScreen[str]):
     #buttons { height: auto; align-horizontal: right; padding-top: 1; }
     Button { margin-left: 1; min-width: 10; height: 1; border: none; }
     """
-    BINDINGS = [("escape", "cancel", "cancel")]
+    BINDINGS = [
+        # `q` would type a letter into the form, so esc is the visible one.
+        Binding("escape", "quit", "quit (or ^c)"),
+        Binding("ctrl+c", "quit", "quit", show=False),
+        ("backspace", "cancel", "cancel"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
@@ -117,3 +123,6 @@ class QueryBuilder(ModalScreen[str]):
 
     def action_cancel(self) -> None:
         self.dismiss("")
+
+    def action_quit(self) -> None:
+        self.app.exit()

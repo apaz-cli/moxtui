@@ -11,14 +11,22 @@ from PyInstaller.utils.hooks import collect_all
 # Textual ships .tcss stylesheets and resolves widgets lazily, so a plain
 # dependency scan misses both. collect_all takes the data files too.
 tcss, tbin, thidden = collect_all("textual")
+# Optional: without it the card panel is text only, so a build that cannot find
+# it is still a working build.
+try:
+    icss, ibin, ihidden = collect_all("textual_image")
+except Exception:
+    icss, ibin, ihidden = [], [], []
 
 a = Analysis(
     ["moxfield.py"],
-    datas=tcss,
-    binaries=tbin,
+    datas=tcss + icss,
+    binaries=tbin + ibin,
     # tui/builder are imported inside a function so the TUI stays optional;
     # name them so the freezer keeps them anyway.
-    hiddenimports=thidden + ["tui", "builder", "engine", "query", "api", "store"],
+    hiddenimports=thidden + ihidden + [
+        "tui", "builder", "engine", "query", "api", "store",
+        "cardlist", "cardpanel", "cardtypes", "colors", "deckview", "scryfall"],
     excludes=["tkinter", "unittest", "pydoc_data", "tree_sitter"],
     noarchive=False,
 )

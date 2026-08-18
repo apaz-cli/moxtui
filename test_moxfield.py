@@ -5,11 +5,22 @@ table, which is enough to pin down every decision it makes.
 """
 
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 import urllib.error
 
+import api as API
+import cardpanel as CP
 import cardtypes as CT
+from cardlist import CardList
+from colors import card_style
+from deckview import ordered
+from textual.app import App
+from textual.containers import VerticalScroll
 import engine as E
 import query as Q
 from store import Store
@@ -133,6 +144,14 @@ class CardTypes(unittest.TestCase):
         self.assertEqual(CT.types_of("Tribal Instant — Zombie"),
                          ["Kindred", "Instant"])
 
+    def test_a_section_with_nothing_shown_is_dropped(self):
+        """A Kindred instant lists under Instant, so Kindred has nothing to show
+        and gets no heading."""
+        deck = [("Kindred Bolt", 1, "R", "Tribal Instant — Goblin", 1)]
+        got = CT.group(deck)
+        self.assertEqual([t for t, _, _ in got], ["Instant"])
+        self.assertEqual(got[0][2], 0)        # and Instant is not "+1" itself
+
     def test_the_rest_is_other(self):
         for line in ("Stickers", "Plane — Dominaria", "Scheme", "", None):
             self.assertEqual(CT.primary(line), "Other")
@@ -154,7 +173,7 @@ class CardTypes(unittest.TestCase):
         # report them -- Artifact also carries the Artifact Creature.
         self.assertEqual(got["Land"], (["Bridge", "Island", "Saga"], 0))
         self.assertEqual(got["Artifact"], (["Sol Ring"], 2))         # Kobold, Bridge
-        self.assertEqual(got["Enchantment"], ([], 1))                # Saga
+        self.assertNotIn("Enchantment", got)      # only a (+1), so no section
         self.assertNotIn("Planeswalker", got)                        # empty, absent
 
     def test_display_order_is_not_precedence_order(self):
@@ -182,6 +201,387 @@ class CardTypes(unittest.TestCase):
                          # cmc 1 first; then W U U G, multicolour, colourless;
                          # the two blues tie on symbols and fall back to name
                          ["cheap", "white", "alpha", "beta", "zed", "gold", "rock"])
+
+
+class DoubleFaced(unittest.TestCase):
+    """A DFC carries an empty top-level `colors` and puts the real ones on each
+    face, so reading only the top level paints every one of them colourless."""
+
+    def test_faces_are_added_together(self):
+        dfc = lambda *faces: {"colors": [],
+                              "card_faces": [{"colors": list(f)} for f in faces]}
+        self.assertEqual(API.card_colors(dfc("R", "")), "R")     # Valakut
+        self.assertEqual(API.card_colors(dfc("R", "R")), "R")    # Birgi
+        self.assertEqual(API.card_colors(dfc("G", "RG")), "RG")  # Invasion
+        self.assertEqual(API.card_colors(dfc("", "")), "")       # both blank
+
+    def test_single_faced_cards_are_unaffected(self):
+        self.assertEqual(API.card_colors({"colors": ["R"]}), "R")
+        self.assertEqual(API.card_colors({"colors": []}), "")
+
+    def test_result_is_in_wubrg_order(self):
+        self.assertEqual(API.card_colors({"colors": ["G", "U", "W"]}), "WUG")
+
+    def test_a_dfc_is_coloured_not_neutral(self):
+        self.assertNotEqual(card_style(API.card_colors(
+            {"colors": [], "card_faces": [{"colors": ["R"]}, {"colors": []}]})),
+            card_style(""))
+
+
+class CellSizeProbe(unittest.TestCase):
+    """textual-image asks the terminal for its cell size by writing an escape
+    sequence and reading the reply from stdin -- which Textual owns and eats, so
+    the probe times out and dumps a traceback when the app releases the terminal
+    on quit. Seeding the answer avoids it, but only if it happens before the
+    widget is imported: the probe fires on import."""
+
+    def test_importing_the_panel_never_probes_stdin(self):
+        script = textwrap.dedent("""
+            import sys
+            sys.path.insert(0, %r)
+            from textual_image import _terminal as t
+            assert not hasattr(t.get_cell_size, "_result")
+            def boom(*a, **k):
+                raise AssertionError("probed stdin")
+            t.capture_terminal_response = boom
+            import cardpanel
+            assert hasattr(t.get_cell_size, "_result")
+            print("OK", t.get_cell_size._result.width, t.get_cell_size._result.height)
+        """) % os.path.dirname(os.path.abspath(__file__))
+        r = subprocess.run([sys.executable, "-c", script],
+                           capture_output=True, text=True)
+        if "No module named" in r.stderr:
+            self.skipTest("textual-image not installed")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertTrue(r.stdout.startswith("OK"), r.stdout)
+
+    def test_the_fallback_keeps_the_two_to_one_cell_ratio(self):
+        """Only the image aspect depends on this, and every common terminal --
+        and the VT340 the library would otherwise assume -- is 1 wide to 2 tall."""
+        import cardpanel
+        from textual_image import _terminal as t
+        size = t.get_cell_size()
+        self.assertAlmostEqual(size.height / size.width, 2.0, delta=0.5)
+
+
+class ImageBox(unittest.TestCase):
+    """The picture is sized into the space the placement reserved, never the
+    other way round -- and the text always keeps enough rows to read."""
+
+    def test_side_leaves_room_for_the_text(self):
+        cols, rows = CP.image_box("side", 44, 37)
+        self.assertGreaterEqual(37 - rows, CP.MIN_TEXT_ROWS)
+        self.assertAlmostEqual(rows / cols, CP.ROWS_PER_COL, delta=0.1)
+
+    def test_a_short_side_panel_shrinks_the_picture_not_the_text(self):
+        cols, rows = CP.image_box("side", 44, 20)
+        self.assertGreaterEqual(20 - rows, CP.MIN_TEXT_ROWS)
+        self.assertLess(cols, 44)
+
+    def test_bottom_is_limited_by_height(self):
+        cols, rows = CP.image_box("bottom", 148, 12)
+        self.assertLessEqual(rows, 12)
+        self.assertLess(cols, 30)          # a strip, with the text beside it
+
+    def test_no_room_means_no_picture(self):
+        cols, rows = CP.image_box("side", 44, 10)
+        self.assertEqual((cols, rows), (0, 0))
+
+
+class PanelImageVisibility(unittest.IsolatedAsyncioTestCase):
+    ENTRY = ("Kobolds of Kher Keep", 1, "R", "Creature — Kobold", 0, "kk")
+
+    class Harness(App):
+        def compose(self):
+            yield CP.CardPanel(id="panel")
+
+    async def panel(self, pilot, where="side", w=46, h=37):
+        p = pilot.app.query_one("#panel", CP.CardPanel)
+        p.fit(where, w, h)
+        await pilot.pause()
+        return p
+
+    async def test_no_picture_gives_the_space_to_the_text(self):
+        if CP.Image is None:
+            self.skipTest("textual-image not installed")
+        app = self.Harness()
+        async with app.run_test(size=(46, 40)) as pilot:
+            p = await self.panel(pilot)
+            p.show(self.ENTRY, None, None)          # nothing to show
+            await pilot.pause()
+            self.assertFalse(p.has_image)
+            self.assertFalse(p.query_one("#cardimg").display)
+
+    async def test_an_unreadable_file_is_not_shown(self):
+        if CP.Image is None:
+            self.skipTest("textual-image not installed")
+        app = self.Harness()
+        async with app.run_test(size=(46, 40)) as pilot:
+            p = await self.panel(pilot)
+            with tempfile.NamedTemporaryFile(suffix=".jpg") as fh:
+                fh.write(b"not a jpeg"); fh.flush()
+                p.show(self.ENTRY, None, fh.name)
+            await pilot.pause()
+            self.assertFalse(p.has_image)
+            self.assertFalse(p.query_one("#cardimg").display)
+
+    async def test_there_is_a_gutter_between_picture_and_text(self):
+        if CP.Image is None:
+            self.skipTest("textual-image not installed")
+        app = self.Harness()
+        async with app.run_test(size=(46, 40)) as pilot:
+            p = await self.panel(pilot, "side", 46, 37)
+            self.assertEqual(p.query_one("#cardimg").styles.margin.bottom,
+                             CP.GUTTER_ROWS)
+            p = await self.panel(pilot, "bottom", 150, 12)
+            self.assertEqual(p.query_one("#cardimg").styles.margin.right,
+                             CP.GUTTER_COLS)
+
+    async def test_a_box_too_small_shows_nothing(self):
+        if CP.Image is None:
+            self.skipTest("textual-image not installed")
+        app = self.Harness()
+        async with app.run_test(size=(46, 40)) as pilot:
+            p = await self.panel(pilot, "side", 46, 11)   # no room after the text
+            p.has_image = True
+            p._reveal()
+            await pilot.pause()
+            self.assertFalse(p.query_one("#cardimg").display)
+
+
+class ImageRenderer(unittest.TestCase):
+    """Which renderer gets chosen. Auto-detection asks the terminal over stdin
+    and gives up after 100ms, so it is wrong under any multiplexer that does not
+    answer -- hence both an override and one known special case."""
+
+    def choose(self, **env):
+        script = ("import sys; sys.path.insert(0, %r); import cardpanel as p; "
+                  "import textual_image.widget as w; "
+                  "print('NONE' if p.Image is None else "
+                  "next(n for n in ('SixelImage','TGPImage','HalfcellImage',"
+                  "'UnicodeImage','AutoImage') if p.Image is getattr(w, n)))"
+                  % os.path.dirname(os.path.abspath(__file__)))
+        base = {k: v for k, v in os.environ.items()
+                if k not in ("MOXFIELD_CARD_IMAGES", "HERDR_ENV")}
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                           text=True, env={**base, **env})
+        if "No module named" in r.stderr:
+            self.skipTest("textual-image not installed")
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        return r.stdout.strip()
+
+    def test_off(self):
+        for off in ("0", "no", "off", "none"):
+            self.assertEqual(self.choose(MOXFIELD_CARD_IMAGES=off), "NONE")
+
+    def test_each_renderer_can_be_forced(self):
+        for name, cls in (("tgp", "TGPImage"), ("kitty", "TGPImage"),
+                          ("sixel", "SixelImage"), ("halfcell", "HalfcellImage"),
+                          ("unicode", "UnicodeImage")):
+            self.assertEqual(self.choose(MOXFIELD_CARD_IMAGES=name), cls, name)
+
+    def test_plain_terminals_are_left_to_auto_detection(self):
+        self.assertEqual(self.choose(), "AutoImage")
+
+    def test_herdr_gets_kitty_without_being_asked(self):
+        """herdr repaints Kitty graphics out of the pane, so the protocol works
+        -- it just never answers the query, so detection would fall back."""
+        self.assertEqual(self.choose(HERDR_ENV="1"), "TGPImage")
+
+    def test_an_explicit_choice_beats_the_herdr_default(self):
+        self.assertEqual(
+            self.choose(HERDR_ENV="1", MOXFIELD_CARD_IMAGES="halfcell"),
+            "HalfcellImage")
+
+
+class ImageCache(unittest.TestCase):
+    def test_the_cache_lives_in_the_system_temp_dir(self):
+        import scryfall
+        d = scryfall.default_cache_dir()
+        self.assertTrue(d.startswith(tempfile.gettempdir()), d)
+        # namespaced, because /tmp is shared and the first user to run this
+        # would otherwise own a directory the next one cannot write to
+        self.assertNotEqual(os.path.basename(d), "moxfield-images")
+
+    def test_it_does_not_depend_on_where_the_database_is(self):
+        import scryfall
+        a = scryfall.Scryfall.__new__(scryfall.Scryfall)
+        b = scryfall.Scryfall.__new__(scryfall.Scryfall)
+        for obj, path in ((a, "/one/place/x.sqlite"), (b, "/other/y.sqlite")):
+            obj.store = type("S", (), {"path": path})()
+            obj.dir = scryfall.default_cache_dir()
+        self.assertEqual(a.dir, b.dir)
+
+    def test_a_cached_image_needs_no_request(self):
+        import scryfall
+        with tempfile.TemporaryDirectory() as d:
+            sf = scryfall.Scryfall.__new__(scryfall.Scryfall)
+            sf.dir, sf._last = d, 0.0
+            sid = "d573ef03-4730-45aa-93dd-e45ac1dbaf4a"
+            open(os.path.join(d, f"{sid}-normal.jpg"), "wb").write(b"x")
+            sf._get = lambda *a, **k: self.fail("should not have fetched")
+            self.assertTrue(sf.image_path(sid).endswith(f"{sid}-normal.jpg"))
+
+    def test_no_id_means_no_image(self):
+        import scryfall
+        sf = scryfall.Scryfall.__new__(scryfall.Scryfall)
+        sf.dir, sf._last = "/nonexistent", 0.0
+        self.assertIsNone(sf.image_path(""))
+
+
+class Cancellation(unittest.TestCase):
+    """Starting a search abandons the one before it. Textual cannot kill a
+    thread worker, so the crawl has to agree to stop -- and the request boundary
+    is where stopping costs nothing."""
+
+    def tearDown(self):
+        API.cancel_when(None)
+
+    def test_an_abandoned_crawl_stops_before_its_next_request(self):
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        store = Store(path)
+        try:
+            client = API.Client(store)
+            API.cancel_when(lambda: True)
+            with self.assertRaises(API.Cancelled):
+                client.get("/v2/decks/search")      # no network: checked first
+            self.assertEqual(client.requests, 0)
+        finally:
+            scrap(store, path)
+
+    def test_it_does_not_leak_to_other_threads(self):
+        """The card panel fetches deck bodies on its own thread and must carry
+        on while a search is being replaced."""
+        import threading
+        API.cancel_when(lambda: True)
+        seen = {}
+
+        def elsewhere():
+            seen["abandoned"] = API._abandoned()
+
+        t = threading.Thread(target=elsewhere)
+        t.start()
+        t.join()
+        self.assertTrue(API._abandoned())           # this thread, yes
+        self.assertFalse(seen["abandoned"])         # that one, no
+
+    def test_clearing_it_lets_requests_through_again(self):
+        API.cancel_when(lambda: True)
+        self.assertTrue(API._abandoned())
+        API.cancel_when(None)
+        self.assertFalse(API._abandoned())
+
+
+class QuitKeys(unittest.TestCase):
+    """ctrl+c, q and esc all quit, from every screen."""
+
+    def bound(self, cls):
+        out = {}
+        for b in cls.BINDINGS:
+            key, action = (b.key, b.action) if hasattr(b, "key") else (b[0], b[1])
+            out[key] = action
+        return out
+
+    def test_ctrl_c_and_esc_quit_everywhere(self):
+        import builder, deckview, tui
+        for cls in (tui.MoxfieldTUI, deckview.DeckView, builder.QueryBuilder):
+            keys = self.bound(cls)
+            for key in ("ctrl+c", "escape"):
+                self.assertEqual(keys.get(key), "quit", f"{cls.__name__} {key}")
+
+    def test_q_quits_the_main_screen_but_backs_out_of_a_deck(self):
+        import deckview, tui
+        self.assertEqual(self.bound(tui.MoxfieldTUI).get("q"), "quit")
+        self.assertEqual(self.bound(deckview.DeckView).get("q"), "close")
+
+    def test_the_footer_entry_names_the_other_keys(self):
+        import deckview, tui
+        shown = [b for b in tui.MoxfieldTUI.BINDINGS
+                 if getattr(b, "action", "") == "quit" and getattr(b, "show", True)]
+        self.assertEqual(len(shown), 1)
+        for other in ("^c", "esc"):
+            self.assertIn(other, shown[0].description)
+        back = [b for b in deckview.DeckView.BINDINGS
+                if getattr(b, "action", "") == "close" and getattr(b, "show", True)]
+        self.assertEqual(len(back), 1)
+        self.assertIn("left", back[0].description)
+
+    def test_enter_and_right_open_a_deck_from_the_table_only(self):
+        """Bound on the table, not the app: an app-level priority binding would
+        fire while the query bar has focus and swallow the search."""
+        import tui
+        keys = {b.key: b.action for b in tui.ResultsTable.BINDINGS}
+        self.assertEqual(keys.get("enter"), "open_deck")
+        self.assertEqual(keys.get("right"), "open_deck")
+        self.assertNotIn("enter", self.bound(tui.MoxfieldTUI))
+
+
+class Flipping(unittest.TestCase):
+    """Clicking turns a double-faced card over -- but only one with a genuine
+    second side. A split or adventure card has two faces on one picture."""
+
+    def panel(self, **detail):
+        p = CP.CardPanel.__new__(CP.CardPanel)
+        p.entry = ("X", 1, "R", "", 0, "u")
+        p.face = 0
+        p.detail = dict({"layout": "", "back_name": "", "name": "X",
+                         "mana_cost": "", "type_line": "", "oracle_text": "",
+                         "power": "", "toughness": "", "loyalty": "",
+                         "flavor_text": ""}, **detail)
+        return p
+
+    def test_a_transform_card_has_a_back(self):
+        for layout in ("transform", "modal_dfc", "double_faced_token"):
+            self.assertTrue(self.panel(layout=layout, back_name="B").two_sided,
+                            layout)
+
+    def test_one_picture_layouts_do_not_flip(self):
+        """Both faces are printed on the front, so there is nothing to turn to."""
+        for layout in ("split", "adventure", "flip", "aftermath", "normal"):
+            self.assertFalse(self.panel(layout=layout, back_name="B").two_sided,
+                             layout)
+
+    def test_a_missing_back_face_does_not_flip(self):
+        self.assertFalse(self.panel(layout="transform", back_name="").two_sided)
+
+    def test_each_side_shows_its_own_name(self):
+        p = self.panel(layout="modal_dfc", name="Valakut Awakening // Valakut Stoneforge",
+                       back_name="Valakut Stoneforge", back_type_line="Land",
+                       type_line="Instant")
+        self.assertIn("Valakut Awakening", str(p.render_card().renderables[0]))
+        self.assertNotIn("//", str(p.render_card().renderables[0]))
+        p.face = 1
+        self.assertIn("Valakut Stoneforge", str(p.render_card().renderables[0]))
+        self.assertIn("Land", str(p.render_card().renderables[1]))
+
+
+class PanelPlacement(unittest.TestCase):
+    """The reserved space goes wherever there is more room. A half-block card
+    image is wider than tall in cells, so the card's own shape does not decide
+    it -- the terminal's does."""
+
+    def test_wide_terminals_get_a_side_panel(self):
+        self.assertEqual(CP.placement(150, 40), "side")
+        self.assertEqual(CP.placement(200, 30), "side")
+        self.assertEqual(CP.placement(120, 40), "side")
+
+    def test_narrow_or_tall_terminals_get_a_bottom_strip(self):
+        self.assertEqual(CP.placement(100, 60), "bottom")
+        self.assertEqual(CP.placement(80, 24), "bottom")
+
+    def test_the_list_is_never_squeezed_below_readable(self):
+        self.assertEqual(CP.placement(50, 20), "hidden")
+        # Wide but short: no room below, so it takes the side instead.
+        self.assertEqual(CP.placement(130, 14), "side")
+
+    def test_the_panel_never_costs_more_than_it_leaves(self):
+        for w, h in ((150, 40), (200, 30), (100, 60), (80, 24)):
+            where = CP.placement(w, h)
+            if where == "side":
+                self.assertGreaterEqual(w - CP.PANEL_W, CP.MIN_LIST_W)
+            elif where == "bottom":
+                self.assertGreaterEqual(h - CP.PANEL_H, CP.MIN_LIST_H)
 
 
 class Evaluating(unittest.TestCase):
@@ -349,6 +749,44 @@ class Ledger(unittest.TestCase):
             self.assertEqual(store.cell({"cardId": "id:A"})["status"], "exact")
         finally:
             scrap(store, path)
+
+
+class Threads(unittest.TestCase):
+    """The TUI reads card detail on the UI thread while its art worker reads and
+    updates the same row from its own. Both go through the same SQL, so one
+    connection hands them one cached prepared statement and each resets it under
+    the other -- which sqlite reports as "bad parameter or other API misuse",
+    naming the read that lost the race rather than the sharing."""
+
+    def test_same_query_from_two_threads(self):
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        store = Store(path)
+        store.put_cards([("uid0", "Dualcaster Mage") + ("",) * 21])
+        store.db.commit()
+
+        errors = []
+        gate = threading.Barrier(2)
+
+        def worker():                       # what fetch_art does, in a loop
+            gate.wait()
+            try:
+                for _ in range(2000):
+                    store.card("uid0")
+                    store.put_original("uid0", ("LEG", "Legends", "1994", "s", "a"))
+            except Exception as e:          # noqa: BLE001
+                errors.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        gate.wait()
+        try:
+            for _ in range(2000):
+                self.assertEqual(store.card("uid0")["name"], "Dualcaster Mage")
+        finally:
+            t.join()
+        self.assertEqual(errors, [])
+        scrap(store, path)
 
 
 class WindowClient(FakeClient):
@@ -626,6 +1064,96 @@ class Residual(unittest.TestCase):
         plan, got = self.run_query('main:"Lightning Bolt"')
         self.assertFalse(plan.needs_body)
         self.assertEqual(got, {"d1", "d2", "d3"})
+
+
+class ListHarness(App):
+    """Just the decklist widget, so this needs no client and no network."""
+
+    def compose(self):
+        with VerticalScroll(id="wrap"):
+            yield CardList({}, ordered, id="cards")
+
+
+class CardListLayout(unittest.IsolatedAsyncioTestCase):
+    # Two types, so the mainboard lays out as two columns and sideways
+    # movement has somewhere to go.
+    DECK = {"commanders": [("Rograkh", 1, "R", "Legendary Creature — Kobold", 0, "a")],
+            "mainboard": [(f"Card {i:02d}", 1, "U",
+                           "Instant" if i % 2 else "Creature — Human",
+                           i % 6, f"u{i}")
+                          for i in range(40)]}
+
+    async def test_content_built_after_mount_is_measured(self):
+        """The regression: a deck body arrives a couple of seconds after the
+        screen mounts, so the widget is laid out while empty. A plain refresh
+        repaints without re-measuring, leaving an auto-height widget one row
+        tall -- one heading visible and the whole decklist invisible."""
+        app = ListHarness()
+        async with app.run_test(size=(120, 30)) as pilot:
+            cards = app.query_one("#cards", CardList)
+            await pilot.pause()
+            cards.boards = self.DECK          # as if the fetch just landed
+            cards.build(100)
+            await pilot.pause()
+            self.assertGreater(len(cards.lines), 10)
+            self.assertGreaterEqual(cards.size.height, len(cards.lines))
+
+    async def test_every_card_gets_a_clickable_spot(self):
+        app = ListHarness()
+        async with app.run_test(size=(120, 30)) as pilot:
+            cards = app.query_one("#cards", CardList)
+            cards.boards = self.DECK
+            cards.build(100)
+            await pilot.pause()
+            self.assertEqual(len(cards.cards), 41)
+            self.assertEqual(len(cards.spots), 41)
+            # no two cards claim the same cell
+            cells = {(y, x) for y, x0, x1, _ in cards.spots for x in range(x0, x1)}
+            self.assertEqual(len(cells),
+                             sum(x1 - x0 for _, x0, x1, _ in cards.spots))
+
+    async def test_columns_never_overflow_the_width(self):
+        """A line wider than the widget wraps, and the wrapped remainder is
+        emitted full width -- which shoves every column after it out of
+        alignment. Nothing may exceed the width it was laid out for."""
+        app = ListHarness()
+        async with app.run_test(size=(120, 30)) as pilot:
+            cards = app.query_one("#cards", CardList)
+            cards.boards = self.DECK
+            await pilot.pause()
+            for width in (60, 80, 100, 140):
+                cards.build(width)
+                self.assertLessEqual(max(l.cell_len for l in cards.lines), width,
+                                     f"overflowed at width {width}")
+
+    async def test_an_unavoidably_long_name_crops_rather_than_wraps(self):
+        app = ListHarness()
+        async with app.run_test(size=(120, 30)) as pilot:
+            cards = app.query_one("#cards", CardList)
+            cards.boards = {"mainboard": [
+                ("Asmoranomardicadaistinaculdacar the Exceedingly Long", 1, "B",
+                 "Legendary Creature — Human", 3, "x")]}
+            cards.build(30)
+            await pilot.pause()
+            rendered = cards.render()
+            self.assertTrue(rendered.no_wrap)
+            self.assertEqual(rendered.overflow, "crop")
+
+    async def test_movement_follows_screen_position(self):
+        app = ListHarness()
+        async with app.run_test(size=(120, 30)) as pilot:
+            cards = app.query_one("#cards", CardList)
+            cards.boards = self.DECK
+            cards.build(100)
+            await pilot.pause()
+            start = cards._spot(cards.cursor)
+            cards.action_move(0, 1)
+            self.assertGreater(cards._spot(cards.cursor)[0], start[0])  # below
+            row = cards._spot(cards.cursor)[0]
+            cards.action_move(1, 0)
+            after = cards._spot(cards.cursor)
+            self.assertEqual(after[0], row)                             # same row
+            self.assertGreater(after[1], 0)                             # to the right
 
 
 if __name__ == "__main__":
